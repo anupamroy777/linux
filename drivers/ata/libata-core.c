@@ -4105,6 +4105,7 @@ static const struct ata_dev_quirks_entry __ata_dev_quirks[] = {
 	{ "Crucial_CT960M500*",		NULL,	ATA_QUIRK_NO_NCQ_TRIM |
 						ATA_QUIRK_ZERO_AFTER_TRIM |
 						ATA_QUIRK_NOLPM },
+	{ "CT500BX500SSD1",		NULL,	ATA_QUIRK_NOLPM },
 
 	/* AMD Radeon devices with broken LPM support */
 	{ "R3SL240G",			NULL,	ATA_QUIRK_NOLPM },

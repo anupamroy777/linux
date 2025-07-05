@@ -550,7 +550,7 @@ static const struct dmi_system_id asus_quirks[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
 			DMI_MATCH(DMI_PRODUCT_NAME, "UX8406CA"),
 		},
-		.driver_data = &quirk_asus_zenbook_duo_kbd,
+		.driver_data = &quirk_asus_wlan_ignore,
 	},
 	{},
 };

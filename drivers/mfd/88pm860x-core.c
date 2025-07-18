@@ -623,8 +623,8 @@ static int device_irq_init(struct pm860x_chip *chip,
 		ret = -EBUSY;
 		goto out;
 	}
-	irq_domain_create_legacy(of_fwnode_handle(i2c->dev.of_node), nr_irqs,
-				 chip->irq_base, 0, &pm860x_irq_domain_ops, chip);
+	irq_domain_create_legacy(dev_fwnode(&i2c->dev), nr_irqs, chip->irq_base, 0,
+				 &pm860x_irq_domain_ops, chip);
 	chip->core_irq = i2c->irq;
 	if (!chip->core_irq)
 		goto out;

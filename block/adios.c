@@ -938,13 +938,13 @@ static int adios_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx) {
 }
 
 // Initialize the scheduler-specific data when initializing the request queue
-static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
+static int adios_init_sched(struct request_queue *q, struct elevator_type *e, struct elevator_tags *et) {
 	struct adios_data *ad;
 	struct elevator_queue *eq;
 	int ret = -ENOMEM;
 	int cpu = 0;
 
-	eq = elevator_alloc(q, e);
+	eq = elevator_alloc(q, e, et);
 	if (!eq)
 		return ret;
 

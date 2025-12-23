@@ -15,6 +15,7 @@
 
 #include <linux/acpi.h>
 #include <linux/backlight.h>
+#include <linux/bits.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dmi.h>
@@ -30,6 +31,7 @@
 #include <linux/pci.h>
 #include <linux/pci_hotplug.h>
 #include <linux/platform_data/x86/asus-wmi.h>
+#include <linux/platform_data/x86/asus-wmi-leds-ids.h>
 #include <linux/platform_device.h>
 #include <linux/platform_profile.h>
 #include <linux/power_supply.h>
@@ -558,15 +560,15 @@ static int asus_wmi_get_devstate(struct asus_wmi *asus, u32 dev_id, u32 *retval)
 	return 0;
 }
 
-
 /**
  * asus_wmi_get_devstate_dsts() - Get the WMI function state.
  * @dev_id: The WMI method ID to call.
  * @retval: A pointer to where to store the value returned from WMI.
  *
- * On success the return value is 0, and the retval is a valid value returned
- * by the successful WMI function call otherwise an error is returned if the
- * call failed, or if the WMI method ID is unsupported.
+ * Returns:
+ * * %-ENODEV	- method ID is unsupported.
+ * * %0		- successful and retval is filled.
+ * * %other	- error from WMI call.
  */
 int asus_wmi_get_devstate_dsts(u32 dev_id, u32 *retval)
 {
@@ -576,7 +578,7 @@ int asus_wmi_get_devstate_dsts(u32 dev_id, u32 *retval)
 	if (err)
 		return err;
 
-	if (*retval == ASUS_WMI_UNSUPPORTED_METHOD)
+	if ((*retval & ASUS_WMI_DSTS_PRESENCE_BIT) == 0x00)
 		return -ENODEV;
 
 	return 0;
@@ -585,17 +587,18 @@ EXPORT_SYMBOL_NS_GPL(asus_wmi_get_devstate_dsts, "ASUS_WMI");
 
 /**
  * asus_wmi_set_devstate() - Set the WMI function state.
+ *
+ * Note: an asus_wmi_set_devstate() call must be paired with a
+ * asus_wmi_get_devstate_dsts() to check if the WMI function is supported.
+ *
  * @dev_id: The WMI function to call.
  * @ctrl_param: The argument to be used for this WMI function.
  * @retval: A pointer to where to store the value returned from WMI.
  *
- * The returned WMI function state if not checked here for error as
- * asus_wmi_set_devstate() is not called unless first paired with a call to
- * asus_wmi_get_devstate_dsts() to check that the WMI function is supported.
- *
- * On success the return value is 0, and the retval is a valid value returned
- * by the successful WMI function call. An error value is returned only if the
- * WMI function failed.
+ * Returns:
+ * * %-ENODEV	- method ID is unsupported.
+ * * %0			- successful and retval is filled.
+ * * %other		- error from WMI call.
  */
 int asus_wmi_set_devstate(u32 dev_id, u32 ctrl_param, u32 *retval)
 {
@@ -1216,7 +1219,7 @@ static ssize_t ppt_fppt_store(struct device *dev,
 	if (value < PPT_TOTAL_MIN || value > PPT_TOTAL_MAX)
 		return -EINVAL;
 
-	err = asus_wmi_set_devstate(ASUS_WMI_DEVID_PPT_FPPT, value, &result);
+	err = asus_wmi_set_devstate(ASUS_WMI_DEVID_PPT_PL3_FPPT, value, &result);
 	if (err) {
 		pr_warn("Failed to set ppt_fppt: %d\n", err);
 		return err;
@@ -1794,18 +1797,17 @@ static void do_kbd_led_set(struct led_classdev *led_cdev, int value)
 		listener->brightness_set(listener, asus->kbd_led_wk);
 }
 
-static void kbd_led_set(struct led_classdev *led_cdev,
-			enum led_brightness value)
+static int kbd_led_set(struct led_classdev *led_cdev, enum led_brightness value)
 {
 	unsigned long flags;
 
 	/* Prevent disabling keyboard backlight on module unregister */
 	if (led_cdev->flags & LED_UNREGISTERING)
-		return;
+		return 0;
 
 	spin_lock_irqsave(&asus_ref.lock, flags);
 	do_kbd_led_set(led_cdev, value);
-	spin_unlock_irqrestore(&asus_ref.lock, flags);
+	return 0;
 }
 
 static void kbd_led_set_by_kbd(struct asus_wmi *asus, enum led_brightness value)
@@ -1994,17 +1996,14 @@ static int asus_wmi_led_init(struct asus_wmi *asus)
 			goto error;
 	}
 
-	asus->kbd_led.name = "asus::kbd_backlight";
-	asus->kbd_led.flags = LED_BRIGHT_HW_CHANGED;
-	asus->kbd_led.brightness_set = kbd_led_set;
-	asus->kbd_led.brightness_get = kbd_led_get;
-	asus->kbd_led.max_brightness = ASUS_EV_MAX_BRIGHTNESS;
-	asus->kbd_led_avail = !kbd_led_read(asus, &led_val, NULL);
 
 	if (asus->kbd_led_avail)
 		asus->kbd_led_wk = led_val;
-	else
-		asus->kbd_led_wk = -1;
+		asus->kbd_led.name = "asus::kbd_backlight";
+		asus->kbd_led.flags = LED_BRIGHT_HW_CHANGED;
+		asus->kbd_led.brightness_set_blocking = kbd_led_set;
+		asus->kbd_led.brightness_get = kbd_led_get;
+		asus->kbd_led.max_brightness = 3;
 
 	if (asus->kbd_led_avail && num_rgb_groups != 0)
 		asus->kbd_led.groups = kbd_rgb_mode_groups;
@@ -4720,7 +4719,7 @@ static umode_t asus_sysfs_is_visible(struct kobject *kobj,
 	else if (attr == &dev_attr_ppt_pl1_spl.attr)
 		devid = ASUS_WMI_DEVID_PPT_PL1_SPL;
 	else if (attr == &dev_attr_ppt_fppt.attr)
-		devid = ASUS_WMI_DEVID_PPT_FPPT;
+		devid = ASUS_WMI_DEVID_PPT_PL3_FPPT;
 	else if (attr == &dev_attr_ppt_apu_sppt.attr)
 		devid = ASUS_WMI_DEVID_PPT_APU_SPPT;
 	else if (attr == &dev_attr_ppt_platform_sppt.attr)

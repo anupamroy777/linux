@@ -1,4 +1,5 @@
-/* BBR (Bottleneck Bandwidth and RTT) congestion control
+// SPDX-License-Identifier: GPL-2.0
+/* Bottleneck Bandwidth and RTT (BBR) congestion control
  *
  * BBR is a model-based congestion control algorithm that aims for low queues,
  * low loss, and (bounded) Reno/CUBIC coexistence. To maintain a model of the
@@ -530,14 +531,12 @@ static void bbr_save_cwnd(struct sock *sk)
 		bbr->prior_cwnd = max(bbr->prior_cwnd, tcp_snd_cwnd(tp));
 }
 
-__bpf_kfunc static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
+__bpf_kfunc static void bbr_cwnd_event_tx_start(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	if (event == CA_EVENT_TX_START) {
-		if (!tp->app_limited)
-			return;
+	if (tp->app_limited) {
 		bbr->idle_restart = 1;
 		bbr->ack_epoch_mstamp = tp->tcp_mstamp;
 		bbr->ack_epoch_acked = 0;
@@ -2350,7 +2349,7 @@ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
 	.sndbuf_expand	= bbr_sndbuf_expand,
 	.skb_marked_lost = bbr_skb_marked_lost,
 	.undo_cwnd	= bbr_undo_cwnd,
-	.cwnd_event	= bbr_cwnd_event,
+	.cwnd_event_tx_start	= bbr_cwnd_event_tx_start,
 	.ssthresh	= bbr_ssthresh,
 	.tso_segs	= bbr_tso_segs,
 	.get_info	= bbr_get_info,
@@ -2363,7 +2362,7 @@ BTF_ID_FLAGS(func, bbr_main)
 BTF_ID_FLAGS(func, bbr_sndbuf_expand)
 BTF_ID_FLAGS(func, bbr_skb_marked_lost)
 BTF_ID_FLAGS(func, bbr_undo_cwnd)
-BTF_ID_FLAGS(func, bbr_cwnd_event)
+BTF_ID_FLAGS(func, bbr_cwnd_event_tx_start)
 BTF_ID_FLAGS(func, bbr_ssthresh)
 BTF_ID_FLAGS(func, bbr_tso_segs)
 BTF_ID_FLAGS(func, bbr_set_state)

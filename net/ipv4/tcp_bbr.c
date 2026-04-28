@@ -547,16 +547,6 @@ __bpf_kfunc static void bbr_cwnd_event_tx_start(struct sock *sk)
 			bbr_set_pacing_rate(sk, bbr_bw(sk), BBR_UNIT);
 		else if (bbr->mode == BBR_PROBE_RTT)
 			bbr_check_probe_rtt_done(sk);
-	} else if ((event == CA_EVENT_ECN_IS_CE ||
-		    event == CA_EVENT_ECN_NO_CE) &&
-		   bbr_can_use_ecn(sk) &&
-		   bbr_param(sk, precise_ece_ack)) {
-		u32 state = bbr->ce_state;
-		dctcp_ece_ack_update(sk, event, &bbr->prior_rcv_nxt, &state);
-		bbr->ce_state = state;
-	} else if (event == CA_EVENT_TLP_RECOVERY &&
-		   bbr_param(sk, loss_probe_recovery)) {
-		bbr_run_loss_probe_recovery(sk);
 	}
 }
 

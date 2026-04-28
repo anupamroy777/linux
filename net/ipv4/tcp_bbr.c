@@ -181,10 +181,17 @@ struct bbr_context {
 	u32 sample_bw;
 };
 
+#define CYCLE_LEN	8	/* number of phases in a pacing gain cycle */
+
+/* Window length of bw filter (in rounds): */
+static const int bbr_bw_rtts = CYCLE_LEN + 2;
 /* Window length of min_rtt filter (in sec): */
 static const u32 bbr_min_rtt_win_sec = 10;
 /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
 static const u32 bbr_probe_rtt_mode_ms = 200;
+/* Skip TSO below the following bandwidth (bits/sec): */
+static const int bbr_min_tso_rate = 1200000;
+
 /* Window length of probe_rtt_min_us filter (in ms), and consequently the
  * typical interval between PROBE_RTT mode entries. The default is 5000ms.
  * Note that bbr_probe_rtt_win_ms must be <= bbr_min_rtt_win_sec * MSEC_PER_SEC
@@ -229,6 +236,10 @@ static const int bbr_pacing_gain[] = {
 	BBR_UNIT,		/* CRUISE: try to use pipe w/ some headroom */
 	BBR_UNIT,		/* REFILL: refill pipe to estimated 100% */
 };
+
+/* Randomize the starting gain cycling phase over N phases: */
+static const u32 bbr_cycle_rand = 7;
+
 enum bbr_pacing_gain_phase {
 	BBR_BW_PROBE_UP		= 0,  /* push up inflight to probe for bw/vol */
 	BBR_BW_PROBE_DOWN	= 1,  /* drain excess inflight from the queue */
@@ -671,6 +682,15 @@ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
 	return aggr_cwnd;
 }
 
+static void bbr_advance_cycle_phase(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct bbr *bbr = inet_csk_ca(sk);
+
+	bbr->cycle_idx = (bbr->cycle_idx + 1) & (CYCLE_LEN - 1);
+	bbr->cycle_mstamp = tp->delivered_mstamp;
+}
+
 /* Returns the cwnd for PROBE_RTT mode. */
 static u32 bbr_probe_rtt_cwnd(struct sock *sk)
 {
@@ -727,6 +747,23 @@ static void bbr_reset_startup_mode(struct sock *sk)
 	struct bbr *bbr = inet_csk_ca(sk);
 
 	bbr->mode = BBR_STARTUP;
+}
+
+static void bbr_reset_probe_bw_mode(struct sock *sk)
+{
+	struct bbr *bbr = inet_csk_ca(sk);
+
+	bbr->mode = BBR_PROBE_BW;
+	bbr->cycle_idx = CYCLE_LEN - 1 - get_random_u32_below(bbr_cycle_rand);
+	bbr_advance_cycle_phase(sk);	/* flip to next phase of gain cycle */
+}
+
+static void bbr_reset_mode(struct sock *sk)
+{
+	if (!bbr_full_bw_reached(sk))
+		bbr_reset_startup_mode(sk);
+	else
+		bbr_reset_probe_bw_mode(sk);
 }
 
 /* See if we have reached next round trip. Upon start of the new round,
@@ -837,6 +874,49 @@ static void bbr_update_ack_aggregation(struct sock *sk,
 	extra_acked = min(extra_acked, tcp_snd_cwnd(tp));
 	if (extra_acked > bbr->extra_acked[bbr->extra_acked_win_idx])
 		bbr->extra_acked[bbr->extra_acked_win_idx] = extra_acked;
+}
+
+/* Estimate when the pipe is full, using the change in delivery rate: BBR
+ * estimates that STARTUP filled the pipe if the estimated bw hasn't changed by
+ * at least bbr_full_bw_thresh (25%) after bbr_full_bw_cnt (3) non-app-limited
+ * rounds. Why 3 rounds: 1: rwin autotuning grows the rwin, 2: we fill the
+ * higher rwin, 3: we get higher delivery rate samples. Or transient
+ * cross-traffic or radio noise can go away. CUBIC Hystart shares a similar
+ * design goal, but uses delay and inter-ACK spacing instead of bandwidth.
+ */
+static void bbr_check_full_bw_reached(struct sock *sk,
+				      const struct rate_sample *rs)
+{
+	struct bbr *bbr = inet_csk_ca(sk);
+	u32 bw_thresh;
+
+	if (bbr_full_bw_reached(sk) || !bbr->round_start || rs->is_app_limited)
+		return;
+
+	bw_thresh = (u64)bbr->full_bw * bbr_full_bw_thresh >> BBR_SCALE;
+	if (bbr_max_bw(sk) >= bw_thresh) {
+		bbr->full_bw = bbr_max_bw(sk);
+		bbr->full_bw_cnt = 0;
+		return;
+	}
+	++bbr->full_bw_cnt;
+	bbr->full_bw_reached = bbr->full_bw_cnt >= bbr_full_bw_cnt;
+}
+
+/* If pipe is probably full, drain the queue and then enter steady-state. */
+static void bbr_check_drain(struct sock *sk, const struct rate_sample *rs)
+{
+	struct bbr *bbr = inet_csk_ca(sk);
+
+	if (bbr->mode == BBR_STARTUP && bbr_full_bw_reached(sk)) {
+		bbr->mode = BBR_DRAIN;	/* drain queue we created */
+		WRITE_ONCE(tcp_sk(sk)->snd_ssthresh,
+			   bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT));
+	}	/* fall through to check if in-flight is already small: */
+	if (bbr->mode == BBR_DRAIN &&
+	    bbr_packets_in_net_at_edt(sk, tcp_packets_in_flight(tcp_sk(sk))) <=
+	    bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT))
+		bbr_reset_probe_bw_mode(sk);  /* we estimate queue is drained */
 }
 
 static void bbr_check_probe_rtt_done(struct sock *sk)
@@ -1740,6 +1820,7 @@ static bool bbr_check_time_to_cruise(struct sock *sk, u32 inflight, u32 bw)
 	return inflight <= bbr_inflight(sk, bw, BBR_UNIT);
 }
 
+
 /* PROBE_BW state machine: cruise, refill, probe for bw, or drain? */
 static void bbr_update_cycle_phase(struct sock *sk,
 				    const struct rate_sample *rs,
@@ -1903,71 +1984,14 @@ static void bbr_check_loss_too_high_in_startup(struct sock *sk,
 		bbr->loss_events_in_round = 0;
 }
 
-/* Estimate when the pipe is full, using the change in delivery rate: BBR
- * estimates bw probing filled the pipe if the estimated bw hasn't changed by
- * at least bbr_full_bw_thresh (25%) after bbr_full_bw_cnt (3) non-app-limited
- * rounds. Why 3 rounds: 1: rwin autotuning grows the rwin, 2: we fill the
- * higher rwin, 3: we get higher delivery rate samples. Or transient
- * cross-traffic or radio noise can go away. CUBIC Hystart shares a similar
- * design goal, but uses delay and inter-ACK spacing instead of bandwidth.
- */
-static void bbr_check_full_bw_reached(struct sock *sk,
-				       const struct rate_sample *rs,
-				       struct bbr_context *ctx)
-{
-	struct bbr *bbr = inet_csk_ca(sk);
-	u32 bw_thresh, full_cnt, thresh;
-
-	if (bbr->full_bw_now || rs->is_app_limited)
-		return;
-
-	thresh = bbr_param(sk, full_bw_thresh);
-	full_cnt = bbr_param(sk, full_bw_cnt);
-	bw_thresh = (u64)bbr->full_bw * thresh >> BBR_SCALE;
-	if (ctx->sample_bw >= bw_thresh) {
-		bbr_reset_full_bw(sk);
-		bbr->full_bw = ctx->sample_bw;
-		return;
-	}
-	if (!bbr->round_start)
-		return;
-	++bbr->full_bw_cnt;
-	bbr->full_bw_now = bbr->full_bw_cnt >= full_cnt;
-	bbr->full_bw_reached |= bbr->full_bw_now;
-}
-
-/* If pipe is probably full, drain the queue and then enter steady-state. */
-static void bbr_check_drain(struct sock *sk, const struct rate_sample *rs,
-			    struct bbr_context *ctx)
-{
-	struct bbr *bbr = inet_csk_ca(sk);
-
-	if (bbr->mode == BBR_STARTUP && bbr_full_bw_reached(sk)) {
-		bbr->mode = BBR_DRAIN;	/* drain queue we created */
-		/* Set ssthresh to export purely for monitoring, to signal
-		 * completion of initial STARTUP by setting to a non-
-		 * TCP_INFINITE_SSTHRESH value (ssthresh is not used by BBR).
-		 */
-		tcp_sk(sk)->snd_ssthresh =
-				bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT);
-		bbr_reset_congestion_signals(sk);
-	}	/* fall through to check if in-flight is already small: */
-	if (bbr->mode == BBR_DRAIN &&
-	    bbr_packets_in_net_at_edt(sk, tcp_packets_in_flight(tcp_sk(sk))) <=
-	    bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT)) {
-		bbr->mode = BBR_PROBE_BW;
-		bbr_start_bw_probe_down(sk);
-	}
-}
-
 static void bbr_update_model(struct sock *sk, const struct rate_sample *rs,
 			      struct bbr_context *ctx)
 {
 	bbr_update_congestion_signals(sk, rs, ctx);
 	bbr_update_ack_aggregation(sk, rs);
 	bbr_check_loss_too_high_in_startup(sk, rs);
-	bbr_check_full_bw_reached(sk, rs, ctx);
-	bbr_check_drain(sk, rs, ctx);
+	bbr_check_full_bw_reached(sk, rs);
+	bbr_check_drain(sk, rs);
 	bbr_update_cycle_phase(sk, rs, ctx);
 	bbr_update_min_rtt(sk, rs);
 }
@@ -2007,7 +2031,7 @@ static bool bbr_run_fast_path(struct sock *sk, bool *update_model,
 	    !bbr->loss_in_round && !bbr->ecn_in_round ) {
 		prev_mode = bbr->mode;
 		prev_min_rtt_us = bbr->min_rtt_us;
-		bbr_check_drain(sk, rs, ctx);
+		bbr_check_drain(sk, rs);
 		bbr_update_cycle_phase(sk, rs, ctx);
 		bbr_update_min_rtt(sk, rs);
 
@@ -2070,11 +2094,8 @@ __bpf_kfunc static void bbr_init(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	bbr->initialized = 1;
-
-	bbr->init_cwnd = min(0x7FU, tcp_snd_cwnd(tp));
-	bbr->prior_cwnd = tp->prior_cwnd;
-	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
+	bbr->prior_cwnd = 0;
+	WRITE_ONCE(tp->snd_ssthresh, TCP_INFINITE_SSTHRESH);
 	bbr->next_rtt_delivered = tp->delivered;
 	bbr->prev_ca_state = TCP_CA_Open;
 

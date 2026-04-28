@@ -1556,7 +1556,10 @@ static ssize_t charge_control_end_threshold_show(struct device *device,
 						 struct device_attribute *attr,
 						 char *buf)
 {
-	return sysfs_emit(buf, "%d\n", charge_end_threshold);
+	if ((charge_end_threshold >= 0) && (charge_end_threshold <= 100))
+		return sysfs_emit(buf, "%d\n", charge_end_threshold);
+
+	return -ENODATA;
 }
 
 static DEVICE_ATTR_RW(charge_control_end_threshold);
@@ -1579,11 +1582,11 @@ static int asus_wmi_battery_add(struct power_supply *battery, struct acpi_batter
 		return -ENODEV;
 
 	/* The charge threshold is only reset when the system is power cycled,
-	 * and we can't get the current threshold so let set it to 100% when
-	 * a battery is added.
+	 * and we can't read the current threshold, however the majority of
+	 * platforms retains it, therefore signal the threshold as unknown
+	 * until user explicitly sets it to a new value.
 	 */
-	asus_wmi_set_devstate(ASUS_WMI_DEVID_RSOC, 100, NULL);
-	charge_end_threshold = 100;
+	charge_end_threshold = -1;
 
 	return 0;
 }
@@ -4420,21 +4423,19 @@ static int read_screenpad_brightness(struct backlight_device *bd)
 	if (err < 0)
 		return err;
 
-	return (retval & ASUS_WMI_DSTS_BRIGHTNESS_MASK);
+	return retval & ASUS_WMI_DSTS_BRIGHTNESS_MASK;
 }
 
 static int update_screenpad_bl_status(struct backlight_device *bd)
 {
+	u32 ctrl_param = bd->props.brightness;
 	int err = 0;
-	u32 ctrl_param;
 
-	ctrl_param = bd->props.brightness;
-	if (ctrl_param >= 0 && bd->props.power) {
-		err = asus_wmi_set_devstate(ASUS_WMI_DEVID_SCREENPAD_POWER, 1,
-					    NULL);
+	if (bd->props.power) {
+		err = asus_wmi_set_devstate(ASUS_WMI_DEVID_SCREENPAD_POWER, 1, NULL);
 		if (err < 0)
 			return err;
-		ctrl_param = bd->props.brightness;
+
 		err = asus_wmi_set_devstate(ASUS_WMI_DEVID_SCREENPAD_LIGHT, ctrl_param, NULL);
 		if (err < 0)
 			return err;
@@ -5410,17 +5411,3 @@ void asus_wmi_unregister_driver(struct asus_wmi_driver *driver)
 	used = false;
 }
 EXPORT_SYMBOL_GPL(asus_wmi_unregister_driver);
-
-static int __init asus_wmi_init(void)
-{
-	pr_info("ASUS WMI generic driver loaded\n");
-	return 0;
-}
-
-static void __exit asus_wmi_exit(void)
-{
-	pr_info("ASUS WMI generic driver unloaded\n");
-}
-
-module_init(asus_wmi_init);
-module_exit(asus_wmi_exit);

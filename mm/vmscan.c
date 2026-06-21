@@ -4920,7 +4920,7 @@ static int isolate_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 {
 	int i;
 	int total_scanned = 0;
-	int type = get_type_to_scan(lruvec, swappiness);
+	int type = get_type_to_scan(lruvec, sc, swappiness);
 
 	for_each_evictable_type(i, swappiness) {
 		int scanned;

@@ -10,12 +10,19 @@ include $(srctree)/scripts/Makefile.lib
 # Link of built-in-fixup.a
 # ---------------------------------------------------------------------------
 
+<<<<<<< HEAD
 # '$(AR) mPi' needs 'T' to workaround the bug of llvm-ar <= 14
+=======
+>>>>>>> 322008f87f917e2217eeac386a9410945092eb2e
 quiet_cmd_ar_builtin_fixup = AR      $@
       cmd_ar_builtin_fixup = \
 	rm -f $@; \
 	$(AR) cDPrST $@ $(KBUILD_VMLINUX_OBJS); \
+<<<<<<< HEAD
 	$(AR) mPiT $$($(AR) t $@ | sed -n 1p) $@ $$($(AR) t $@ | grep -F -f $(srctree)/scripts/head-object-list.txt)
+=======
+	$(AR) mPi $$($(AR) t $@ | sed -n 1p) $@ $$($(AR) t $@ | grep -F -f $(srctree)/scripts/head-object-list.txt)
+>>>>>>> 322008f87f917e2217eeac386a9410945092eb2e
 
 targets += built-in-fixup.a
 built-in-fixup.a: $(KBUILD_VMLINUX_OBJS) scripts/head-object-list.txt FORCE
@@ -42,12 +49,20 @@ quiet_cmd_ar_vmlinux.a = GEN     $@
       cmd_ar_vmlinux.a =					\
 	rm -f $@;						\
 	while read -r obj; do					\
+<<<<<<< HEAD
 		if grep -q $${obj} $(word 2, $^); then		\
+=======
+		if grep -Fqx $${obj} $(word 2, $^); then	\
+>>>>>>> 322008f87f917e2217eeac386a9410945092eb2e
 			echo $${obj%.o}.thinlto-native.o;	\
 		else						\
 			echo $${obj};				\
 		fi;						\
+<<<<<<< HEAD
 	done < $< | xargs $(AR) cDPrS $@
+=======
+	done < $< | xargs $(AR) cDPrS --thin $@
+>>>>>>> 322008f87f917e2217eeac386a9410945092eb2e
 
 targets += vmlinux.a
 vmlinux.a: builtin.order vmlinux.thinlto-index FORCE

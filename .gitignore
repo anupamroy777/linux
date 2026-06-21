@@ -189,5 +189,8 @@ sphinx_*/
 /rust-project.json
 build.sh
 
+# rustc error message long types
+*.long-type-*.txt
+
 # bc language scripts (not LLVM bitcode)
 !kernel/time/timeconst.bc

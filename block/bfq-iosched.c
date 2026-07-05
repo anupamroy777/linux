@@ -2679,9 +2679,10 @@ static void bfq_end_wr(struct bfq_data *bfqd)
 	}
 	list_for_each_entry(bfqq, &bfqd->idle_list, bfqq_list)
 		bfq_bfqq_end_wr(bfqq);
-	bfq_end_wr_async(bfqd);
 
 	spin_unlock_irq(&bfqd->lock);
+
+	bfq_end_wr_async(bfqd);
 }
 
 static sector_t bfq_io_struct_pos(void *io_struct, bool request)
@@ -7241,10 +7242,7 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_queue *eq)
 		return -ENOMEM;
 
 	eq->elevator_data = bfqd;
-
-	spin_lock_irq(&q->queue_lock);
 	q->elevator = eq;
-	spin_unlock_irq(&q->queue_lock);
 
 	spin_lock_init(&bfqd->lock);
 
@@ -7279,7 +7277,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_queue *eq)
 	 * If the disk supports multiple actuators, copy independent
 	 * access ranges from the request queue structure.
 	 */
-	spin_lock_irq(&q->queue_lock);
 	if (ia_ranges) {
 		/*
 		 * Check if the disk ia_ranges size exceeds the current bfq
@@ -7305,7 +7302,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_queue *eq)
 		bfqd->sector[0] = 0;
 		bfqd->nr_sectors[0] = get_capacity(q->disk);
 	}
-	spin_unlock_irq(&q->queue_lock);
 
 	INIT_LIST_HEAD(&bfqd->dispatch);
 

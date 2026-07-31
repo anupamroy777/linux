@@ -195,3 +195,9 @@ build.sh
 
 # bc language scripts (not LLVM bitcode)
 !kernel/time/timeconst.bc
+Dockerfile
+check-config.sh
+docker_build.sh
+error.log
+host_install.sh
+host_out/

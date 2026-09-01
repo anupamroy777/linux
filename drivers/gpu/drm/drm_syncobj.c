@@ -237,14 +237,6 @@ static void
 syncobj_eventfd_entry_func(struct drm_syncobj *syncobj,
 			   struct syncobj_eventfd_entry *entry);
 
-/*
- * Empirically vast majority of ioctls pass in a single syncobj (96%) and never
- * more than three points. Therefore implement a fast path with a small stack
- * array to avoid going into the allocator sometimes several times per
- * userspace rendered frame.
- */
-#define DRM_SYNCOBJ_FAST_PATH_ENTRIES 4
-
 /**
  * drm_syncobj_find - lookup and reference a sync object.
  * @file_private: drm file private pointer
@@ -1041,18 +1033,17 @@ static void syncobj_wait_syncobj_func(struct drm_syncobj *syncobj,
 }
 
 static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
-						  u64 __user *user_points,
+						  void __user *user_points,
 						  uint32_t count,
 						  uint32_t flags,
 						  signed long timeout,
 						  uint32_t *idx,
 						  ktime_t *deadline)
 {
-	struct syncobj_wait_entry stack_entries[DRM_SYNCOBJ_FAST_PATH_ENTRIES];
 	struct syncobj_wait_entry *entries;
-	uint32_t signaled_count, i;
 	struct dma_fence *fence;
 	uint64_t *points;
+	uint32_t signaled_count, i;
 
 	if (flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
 		     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
@@ -1060,17 +1051,17 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 		lockdep_assert_none_held_once();
 	}
 
-	entries = kcalloc(count, sizeof(*entries), GFP_KERNEL);
-	if (!entries)
+	points = kmalloc_array(count, sizeof(*points), GFP_KERNEL);
+	if (points == NULL)
 		return -ENOMEM;
 
-	if (count > ARRAY_SIZE(stack_entries)) {
-		entries = kcalloc(count, sizeof(*entries), GFP_KERNEL);
-		if (!entries)
-			return -ENOMEM;
-	} else {
-		memset(stack_entries, 0, sizeof(stack_entries));
-		entries = stack_entries;
+	if (!user_points) {
+		memset(points, 0, count * sizeof(uint64_t));
+
+	} else if (copy_from_user(points, user_points,
+				  sizeof(uint64_t) * count)) {
+		timeout = -EFAULT;
+		goto err_free_points;
 	}
 
 	entries = kzalloc_objs(*entries, count);
@@ -1088,15 +1079,9 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 		struct dma_fence *fence;
 
 		entries[i].task = current;
-		if (user_points &&
-		    copy_from_user(&entries[i].point, user_points++,
-				   sizeof(*user_points))) {
-			timeout = -EFAULT;
-			goto cleanup_entries;
-		}
+		entries[i].point = points[i];
 		fence = drm_syncobj_fence_get(syncobjs[i]);
-		if (!fence ||
-		    dma_fence_chain_find_seqno(&fence, entries[i].point)) {
+		if (!fence || dma_fence_chain_find_seqno(&fence, points[i])) {
 			dma_fence_put(fence);
 			if (flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
 				     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
@@ -1200,9 +1185,7 @@ cleanup_entries:
 						  &entries[i].fence_cb);
 		dma_fence_put(entries[i].fence);
 	}
-
-	if (entries != stack_entries)
-		kfree(entries);
+	kfree(entries);
 
 err_free_points:
 	kfree(points);
@@ -1243,56 +1226,83 @@ signed long drm_timeout_abs_to_jiffies(int64_t timeout_nsec)
 }
 EXPORT_SYMBOL(drm_timeout_abs_to_jiffies);
 
+static int drm_syncobj_array_wait(struct drm_device *dev,
+				  struct drm_file *file_private,
+				  struct drm_syncobj_wait *wait,
+				  struct drm_syncobj_timeline_wait *timeline_wait,
+				  struct drm_syncobj **syncobjs, bool timeline,
+				  ktime_t *deadline)
+{
+	signed long timeout = 0;
+	uint32_t first = ~0;
+
+	if (!timeline) {
+		timeout = drm_timeout_abs_to_jiffies(wait->timeout_nsec);
+		timeout = drm_syncobj_array_wait_timeout(syncobjs,
+							 NULL,
+							 wait->count_handles,
+							 wait->flags,
+							 timeout, &first,
+							 deadline);
+		if (timeout < 0)
+			return timeout;
+		wait->first_signaled = first;
+	} else {
+		timeout = drm_timeout_abs_to_jiffies(timeline_wait->timeout_nsec);
+		timeout = drm_syncobj_array_wait_timeout(syncobjs,
+							 u64_to_user_ptr(timeline_wait->points),
+							 timeline_wait->count_handles,
+							 timeline_wait->flags,
+							 timeout, &first,
+							 deadline);
+		if (timeout < 0)
+			return timeout;
+		timeline_wait->first_signaled = first;
+	}
+	return 0;
+}
+
 static int drm_syncobj_array_find(struct drm_file *file_private,
-				  u32 __user *handles,
+				  void __user *user_handles,
 				  uint32_t count_handles,
-				  struct drm_syncobj **stack_syncobjs,
-				  u32 stack_count,
 				  struct drm_syncobj ***syncobjs_out)
 {
+	uint32_t i, *handles;
 	struct drm_syncobj **syncobjs;
-	uint32_t i;
 	int ret;
 
-	if (!access_ok(handles, count_handles * sizeof(*handles)))
-		return -EFAULT;
+	handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);
+	if (handles == NULL)
+		return -ENOMEM;
 
-	if (count_handles > stack_count) {
-		syncobjs = kmalloc_array(count_handles, sizeof(*syncobjs), GFP_KERNEL);
-		if (!syncobjs)
-			return -ENOMEM;
-	} else {
-		syncobjs = stack_syncobjs;
+	if (copy_from_user(handles, user_handles,
+			   sizeof(uint32_t) * count_handles)) {
+		ret = -EFAULT;
+		goto err_free_handles;
 	}
 
-	for (i = 0; i < count_handles; i++) {
-		u32 handle;
 	syncobjs = kmalloc_objs(*syncobjs, count_handles);
 	if (syncobjs == NULL) {
 		ret = -ENOMEM;
 		goto err_free_handles;
 	}
 
-		if (__get_user(handle, handles++)) {
-			ret = -EFAULT;
-			goto err_put_syncobjs;
-		}
-		syncobjs[i] = drm_syncobj_find(file_private, handle);
+	for (i = 0; i < count_handles; i++) {
+		syncobjs[i] = drm_syncobj_find(file_private, handles[i]);
 		if (!syncobjs[i]) {
 			ret = -ENOENT;
 			goto err_put_syncobjs;
 		}
 	}
 
+	kfree(handles);
 	*syncobjs_out = syncobjs;
 	return 0;
 
 err_put_syncobjs:
 	while (i-- > 0)
 		drm_syncobj_put(syncobjs[i]);
-
-	if (syncobjs != stack_syncobjs)
-		kfree(syncobjs);
+	kfree(syncobjs);
 err_free_handles:
 	kfree(handles);
 
@@ -1313,14 +1323,10 @@ int
 drm_syncobj_wait_ioctl(struct drm_device *dev, void *data,
 		       struct drm_file *file_private)
 {
-	struct drm_syncobj *stack_syncobjs[DRM_SYNCOBJ_FAST_PATH_ENTRIES];
 	struct drm_syncobj_wait *args = data;
-	ktime_t deadline, *pdeadline = NULL;
-	u32 count = args->count_handles;
 	struct drm_syncobj **syncobjs;
 	unsigned int possible_flags;
-	u32 first = ~0;
-	long timeout;
+	ktime_t t, *tp = NULL;
 	int ret = 0;
 
 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
@@ -1333,54 +1339,37 @@ drm_syncobj_wait_ioctl(struct drm_device *dev, void *data,
 	if (args->flags & ~possible_flags)
 		return -EINVAL;
 
-	if (count == 0)
+	if (args->count_handles == 0)
 		return 0;
 
 	ret = drm_syncobj_array_find(file_private,
 				     u64_to_user_ptr(args->handles),
-				     count,
-				     stack_syncobjs,
-				     ARRAY_SIZE(stack_syncobjs),
+				     args->count_handles,
 				     &syncobjs);
 	if (ret < 0)
 		return ret;
 
 	if (args->flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE) {
-		deadline = ns_to_ktime(args->deadline_nsec);
-		pdeadline = &deadline;
+		t = ns_to_ktime(args->deadline_nsec);
+		tp = &t;
 	}
 
-	timeout = drm_timeout_abs_to_jiffies(args->timeout_nsec);
-	timeout = drm_syncobj_array_wait_timeout(syncobjs,
-						 NULL,
-						 count,
-						 args->flags,
-						 timeout,
-						 &first,
-						 pdeadline);
+	ret = drm_syncobj_array_wait(dev, file_private,
+				     args, NULL, syncobjs, false, tp);
 
-	drm_syncobj_array_free(syncobjs, count, syncobjs != stack_syncobjs);
+	drm_syncobj_array_free(syncobjs, args->count_handles);
 
-	if (timeout < 0)
-		return timeout;
-
-	args->first_signaled = first;
-
-	return 0;
+	return ret;
 }
 
 int
 drm_syncobj_timeline_wait_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_private)
 {
-	struct drm_syncobj *stack_syncobjs[DRM_SYNCOBJ_FAST_PATH_ENTRIES];
 	struct drm_syncobj_timeline_wait *args = data;
-	ktime_t deadline, *pdeadline = NULL;
-	u32 count = args->count_handles;
 	struct drm_syncobj **syncobjs;
 	unsigned int possible_flags;
-	u32 first = ~0;
-	long timeout;
+	ktime_t t, *tp = NULL;
 	int ret = 0;
 
 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ_TIMELINE))
@@ -1394,40 +1383,27 @@ drm_syncobj_timeline_wait_ioctl(struct drm_device *dev, void *data,
 	if (args->flags & ~possible_flags)
 		return -EINVAL;
 
-	if (count == 0)
+	if (args->count_handles == 0)
 		return 0;
 
 	ret = drm_syncobj_array_find(file_private,
 				     u64_to_user_ptr(args->handles),
-				     count,
-				     stack_syncobjs,
-				     ARRAY_SIZE(stack_syncobjs),
+				     args->count_handles,
 				     &syncobjs);
 	if (ret < 0)
 		return ret;
 
 	if (args->flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE) {
-		deadline = ns_to_ktime(args->deadline_nsec);
-		pdeadline = &deadline;
+		t = ns_to_ktime(args->deadline_nsec);
+		tp = &t;
 	}
 
-	timeout = drm_timeout_abs_to_jiffies(args->timeout_nsec);
-	timeout = drm_syncobj_array_wait_timeout(syncobjs,
-						 u64_to_user_ptr(args->points),
-						 count,
-						 args->flags,
-						 timeout,
-						 &first,
-						 pdeadline);
+	ret = drm_syncobj_array_wait(dev, file_private,
+				     NULL, args, syncobjs, true, tp);
 
-	drm_syncobj_array_free(syncobjs, count, syncobjs != stack_syncobjs);
+	drm_syncobj_array_free(syncobjs, args->count_handles);
 
-	if (timeout < 0)
-		return timeout;
-
-	args->first_signaled = first;
-
-	return 0;
+	return ret;
 }
 
 static void syncobj_eventfd_entry_fence_func(struct dma_fence *fence,
@@ -1537,7 +1513,6 @@ int
 drm_syncobj_reset_ioctl(struct drm_device *dev, void *data,
 			struct drm_file *file_private)
 {
-	struct drm_syncobj *stack_syncobjs[DRM_SYNCOBJ_FAST_PATH_ENTRIES];
 	struct drm_syncobj_array *args = data;
 	struct drm_syncobj **syncobjs;
 	uint32_t i;
@@ -1555,8 +1530,6 @@ drm_syncobj_reset_ioctl(struct drm_device *dev, void *data,
 	ret = drm_syncobj_array_find(file_private,
 				     u64_to_user_ptr(args->handles),
 				     args->count_handles,
-				     stack_syncobjs,
-				     ARRAY_SIZE(stack_syncobjs),
 				     &syncobjs);
 	if (ret < 0)
 		return ret;
@@ -1564,8 +1537,7 @@ drm_syncobj_reset_ioctl(struct drm_device *dev, void *data,
 	for (i = 0; i < args->count_handles; i++)
 		drm_syncobj_replace_fence(syncobjs[i], NULL);
 
-	drm_syncobj_array_free(syncobjs, args->count_handles,
-			       syncobjs != stack_syncobjs);
+	drm_syncobj_array_free(syncobjs, args->count_handles);
 
 	return 0;
 }
@@ -1574,7 +1546,6 @@ int
 drm_syncobj_signal_ioctl(struct drm_device *dev, void *data,
 			 struct drm_file *file_private)
 {
-	struct drm_syncobj *stack_syncobjs[DRM_SYNCOBJ_FAST_PATH_ENTRIES];
 	struct drm_syncobj_array *args = data;
 	struct drm_syncobj **syncobjs;
 	uint32_t i;
@@ -1592,8 +1563,6 @@ drm_syncobj_signal_ioctl(struct drm_device *dev, void *data,
 	ret = drm_syncobj_array_find(file_private,
 				     u64_to_user_ptr(args->handles),
 				     args->count_handles,
-				     stack_syncobjs,
-				     ARRAY_SIZE(stack_syncobjs),
 				     &syncobjs);
 	if (ret < 0)
 		return ret;
@@ -1604,8 +1573,7 @@ drm_syncobj_signal_ioctl(struct drm_device *dev, void *data,
 			break;
 	}
 
-	drm_syncobj_array_free(syncobjs, args->count_handles,
-			       syncobjs != stack_syncobjs);
+	drm_syncobj_array_free(syncobjs, args->count_handles);
 
 	return ret;
 }
@@ -1614,12 +1582,11 @@ int
 drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 				  struct drm_file *file_private)
 {
-	struct drm_syncobj *stack_syncobjs[DRM_SYNCOBJ_FAST_PATH_ENTRIES];
 	struct drm_syncobj_timeline_array *args = data;
-	uint64_t __user *points = u64_to_user_ptr(args->points);
-	uint32_t i, j, count = args->count_handles;
 	struct drm_syncobj **syncobjs;
 	struct dma_fence_chain **chains;
+	uint64_t *points;
+	uint32_t i, j;
 	int ret;
 
 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ_TIMELINE))
@@ -1633,14 +1600,13 @@ drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 
 	ret = drm_syncobj_array_find(file_private,
 				     u64_to_user_ptr(args->handles),
-				     count,
-				     stack_syncobjs,
-				     ARRAY_SIZE(stack_syncobjs),
+				     args->count_handles,
 				     &syncobjs);
 	if (ret < 0)
 		return ret;
 
-	points = kmalloc_array(count, sizeof(*points), GFP_KERNEL);
+	points = kmalloc_array(args->count_handles, sizeof(*points),
+			       GFP_KERNEL);
 	if (!points) {
 		ret = -ENOMEM;
 		goto out;
@@ -1668,18 +1634,11 @@ drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 		}
 	}
 
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < args->count_handles; i++) {
 		struct dma_fence *fence = dma_fence_get_stub();
-		u64 point = 0;
 
-		if (points && copy_from_user(&point, points++, sizeof(point))) {
-			ret =  -EFAULT;
-			for (j = i; j < count; j++)
-				dma_fence_chain_free(chains[j]);
-			goto err_chains;
-		}
-
-		drm_syncobj_add_point(syncobjs[i], chains[i], fence, point);
+		drm_syncobj_add_point(syncobjs[i], chains[i],
+				      fence, points[i]);
 		dma_fence_put(fence);
 	}
 err_chains:
@@ -1695,7 +1654,6 @@ out:
 int drm_syncobj_query_ioctl(struct drm_device *dev, void *data,
 			    struct drm_file *file_private)
 {
-	struct drm_syncobj *stack_syncobjs[DRM_SYNCOBJ_FAST_PATH_ENTRIES];
 	struct drm_syncobj_timeline_array *args = data;
 	struct drm_syncobj **syncobjs;
 	uint64_t __user *points = u64_to_user_ptr(args->points);
@@ -1714,8 +1672,6 @@ int drm_syncobj_query_ioctl(struct drm_device *dev, void *data,
 	ret = drm_syncobj_array_find(file_private,
 				     u64_to_user_ptr(args->handles),
 				     args->count_handles,
-				     stack_syncobjs,
-				     ARRAY_SIZE(stack_syncobjs),
 				     &syncobjs);
 	if (ret < 0)
 		return ret;
@@ -1759,8 +1715,7 @@ int drm_syncobj_query_ioctl(struct drm_device *dev, void *data,
 		if (ret)
 			break;
 	}
-	drm_syncobj_array_free(syncobjs, args->count_handles,
-			       syncobjs != stack_syncobjs);
+	drm_syncobj_array_free(syncobjs, args->count_handles);
 
 	return ret;
 }

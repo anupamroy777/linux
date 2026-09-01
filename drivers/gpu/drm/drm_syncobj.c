@@ -1300,16 +1300,13 @@ err_free_handles:
 }
 
 static void drm_syncobj_array_free(struct drm_syncobj **syncobjs,
-				   uint32_t count,
-				   bool free_container)
+				   uint32_t count)
 {
 	uint32_t i;
 
 	for (i = 0; i < count; i++)
 		drm_syncobj_put(syncobjs[i]);
-
-	if (free_container)
-		kfree(syncobjs);
+	kfree(syncobjs);
 }
 
 int
@@ -1643,12 +1640,25 @@ drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 	if (ret < 0)
 		return ret;
 
-	chains = kmalloc_array(count, sizeof(void *), GFP_KERNEL);
-	if (!chains) {
+	points = kmalloc_array(count, sizeof(*points), GFP_KERNEL);
+	if (!points) {
 		ret = -ENOMEM;
 		goto out;
 	}
-	for (i = 0; i < count; i++) {
+	if (!u64_to_user_ptr(args->points)) {
+		memset(points, 0, args->count_handles * sizeof(uint64_t));
+	} else if (copy_from_user(points, u64_to_user_ptr(args->points),
+				  sizeof(uint64_t) * args->count_handles)) {
+		ret = -EFAULT;
+		goto err_points;
+	}
+
+	chains = kmalloc_objs(*chains, args->count_handles, GFP_KERNEL);
+	if (!chains) {
+		ret = -ENOMEM;
+		goto err_points;
+	}
+	for (i = 0; i < args->count_handles; i++) {
 		chains[i] = dma_fence_chain_alloc();
 		if (!chains[i]) {
 			for (j = 0; j < i; j++)
@@ -1674,8 +1684,10 @@ drm_syncobj_timeline_signal_ioctl(struct drm_device *dev, void *data,
 	}
 err_chains:
 	kfree(chains);
+err_points:
+	kfree(points);
 out:
-	drm_syncobj_array_free(syncobjs, count, syncobjs != stack_syncobjs);
+	drm_syncobj_array_free(syncobjs, args->count_handles);
 
 	return ret;
 }
